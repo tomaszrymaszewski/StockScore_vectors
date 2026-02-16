@@ -1,0 +1,8 @@
+scikit-learn
+numpy
+pandas
+networkx
+requests
+python-dotenv
+node2vec
+pinecone

@@ -1,0 +1,25 @@
+run_id,universe,period,walk_p,walk_q,dimensions,threshold,use_lasso,graph_mode,hypothesis
+91,sp500,5y,1.0,10.0,64,0.65,False,threshold,SP500 5y q=10.0 - Direct comparison to best R3000 config
+92,sp500,5y,1.0,10.0,64,0.75,False,threshold,SP500 5y q=10.0 strict threshold
+93,sp500,5y,0.8,7.2,64,0.65,False,threshold,SP500 5y q=7.2 - Mid-range parameter
+94,r1000,5y,1.0,0.5,64,0.65,False,threshold,R1000 5y q=0.5 t=0.65 - Direct comparison to R3000 best
+95,r1000,5y,1.0,0.5,64,0.55,False,threshold,R1000 5y q=0.5 t=0.55 - Match R3000 threshold
+96,r3000,5y,1.0,10.0,64,0.65,False,threshold,R3000 5y q=10.0 t=0.65 - Clean ablation vs q=0.5
+97,r3000,5y,1.0,10.0,64,0.55,False,threshold,R3000 5y q=10.0 t=0.55 - Match best config threshold
+98,r3000,5y,0.8,7.2,64,0.65,False,threshold,R3000 5y q=7.2 t=0.65 - Mid-range parameter
+99,sp500,5y,1.0,0.5,64,0.55,False,threshold,SP500 5y q=0.5 t=0.55 - Lower threshold like R3000
+100,r1000,2y,1.0,10.0,64,0.65,False,threshold,R1000 2y q=10.0 t=0.65 - Isolate q effect on 2y
+101,r3000,2y,1.0,10.0,64,0.65,False,threshold,R3000 2y q=10.0 t=0.65 - Already exists as run 83 but verify
+102,sp500,2y,1.0,10.0,64,0.75,False,threshold,SP500 2y q=10.0 t=0.75 - Already exists as 81 but with different threshold
+103,r1000,5y,1.0,10.0,96,0.65,False,threshold,R1000 5y q=10.0 96d t=0.65 - Dimension effect
+104,r3000,5y,1.0,0.5,96,0.65,False,threshold,R3000 5y q=0.5 96d t=0.65 - Match best but higher dim
+105,sp500,5y,1.0,0.5,96,0.65,False,threshold,SP500 5y q=0.5 96d t=0.65 - Dimension effect
+106,r1000,5y,1.0,10.0,64,0.65,False,threshold,R1000 5y q=10.0 t=0.65 - Clean comparison to existing 0.75
+107,r3000,5y,1.0,0.5,64,0.70,False,threshold,R3000 5y q=0.5 t=0.70 - Threshold sensitivity
+108,r3000,5y,1.0,0.5,64,0.60,False,threshold,R3000 5y q=0.5 t=0.60 - Threshold sensitivity (already exists as 72)
+109,r1000,5y,1.0,0.5,64,0.70,False,threshold,R1000 5y q=0.5 t=0.70 - Match best config across universes
+110,r1000,5y,1.0,0.5,64,0.60,False,threshold,R1000 5y q=0.5 t=0.60 - Lower threshold
+111,sp500,5y,1.0,0.5,64,0.70,False,threshold,SP500 5y q=0.5 t=0.70 - Higher threshold
+112,sp500,5y,1.0,0.5,64,0.60,False,threshold,SP500 5y q=0.5 t=0.60 - Lower threshold
+113,r3000,5y,5.0,0.5,64,0.65,False,threshold,R3000 5y p=5.0 q=0.5 - Test p parameter effect
+114,r1000,5y,5.0,0.5,64,0.65,False,threshold,R1000 5y p=5.0 q=0.5 - Test p parameter effect
