@@ -21,14 +21,21 @@ from sklearn.neighbors import NearestNeighbors
 import numpy as np
 import pandas as pd
 import networkx as nx
-import requests
-from dotenv import load_dotenv
 from node2vec import Node2Vec
-from pinecone import Pinecone, ServerlessSpec
-from sklearn.covariance import GraphicalLassoCV
-
-
-load_dotenv()
+from sklearn.covariance import GraphicalLassoCV, GraphicalLasso
+from scipy.sparse.linalg import eigsh
+# `requests`, `dotenv`, and `pinecone` are product-only dependencies (metadata fetch / .env /
+# the vector DB). They are imported lazily/optionally so the research benchmark -- which never
+# touches them -- runs with a minimal dependency set (e.g. inside a lean Modal container).
+try:
+    import requests
+except ImportError:
+    requests = None
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # =============================================================================
 # CONFIGURATION
@@ -51,23 +58,93 @@ class Config:
     walk_p: float = 0.8
     walk_q: float = 7.2
 
+    # Random seed for Node2Vec walks + Word2Vec init. Node2Vec walks are stochastic, so a
+    # single run is a single noisy sample; the benchmark sweeps many seeds and reports
+    # mean +/- std. Determinism also requires workers=1 (set in EmbeddingTrainer).
+    seed: int = 42
+
     # Graph Construction
     # 'threshold' = Connect stocks if correlation > X.
     # 'mst'       = Minimum Spanning Tree.
+    # 'knn'       = Connect each stock to its K strongest-correlated peers.
     graph_filtering: str = "threshold"
 
     # Only used if filtering is 'threshold'
     correlation_threshold: float = 0.65   # Lower = fewer weak connections are broken completely
 
+    # Forced Connectivity: repair under-connected nodes to a minimum degree (the paper's
+    # contribution). Set False to evaluate a plain threshold graph with no repair, which is
+    # one of the competitor baselines.
+    repair_islands: bool = True
+    min_degree: int = 3                   # Target minimum degree used by Forced Connectivity
+
+    # Only used if filtering is 'knn'
+    knn_k: int = 10                       # Edges per node in the kNN graph baseline
+
     # Only used if filtering is 'mst'
     mst_extra_edges_pct: float = 0.05   # 0.0 = Standard MST. 0.05 = Add top 5% of strongest unused edges.
     mst_squared_corr: bool = True    # If True, use (correlation)^2 as weight. Emphasizes very strong relationships.
+    # Distance-transform MST using the standard Mantegna (1999) correlation-network metric
+    # d_ij = sqrt(2(1-rho_ij)) on SIGNED correlation (so strongly negative pairs are far),
+    # with edges relabeled by rho. The classic correlation-network backbone; overrides the
+    # mst_squared_corr / abs weighting above.
+    mst_distance_transform: bool = False
     # -----------------------------------------------------------
+
+    # Node2Vec walk parameters (were previously hard-coded, so could not be tuned/ablated).
+    walk_length: int = 20
+    num_walks: int = 100
+    window: int = 10
 
     # Mathematical Method
     # True = Graphical Lasso (Partial Correlation). Removes indirect market noise.
     # False = Standard Pearson Correlation. Captures raw movement similarity.
     use_precision_matrix: bool = False
+    # GraphicalLasso is O(n^3) and slow -- only viable on SMALL graphs.
+    #   lasso_alpha = 0.0  -> GraphicalLassoCV (picks alpha by CV; slowest).
+    #   lasso_alpha > 0.0  -> fixed-alpha GraphicalLasso (fast; HIGHER alpha = sparser graph,
+    #                         the natural way to keep the partial-correlation graph from having
+    #                         too many edges).
+    # The result is normalized to a partial-correlation matrix (entries in [-1, 1]), so the same
+    # `correlation_threshold` scale applies -- use a SMALL threshold for lasso (~0.02-0.1), not
+    # 0.65 (partial correlations are much smaller than raw correlations).
+    lasso_alpha: float = 0.0
+
+    # Market-neutral residualization: regress each stock's returns on a market factor and keep
+    # the residual, so edges reflect IDIOSYNCRATIC co-movement rather than everything moving with
+    # the market. A cheap, O(n*T) alternative to Graphical Lasso for removing co-movement -- it
+    # scales to large universes where the lasso's O(n^3) is infeasible. The factor is the "SPY"
+    # column if present, else an equal-weighted average of all stocks. Composes with either the
+    # correlation or the lasso path (residualize first, then build the matrix).
+    market_neutral: bool = False
+
+    # Cross-sectional demeaning: subtract each day's equal-weighted cross-sectional mean return
+    # before building the matrix. Removes the common daily move with no betas / no regression /
+    # no external index; O(n*T), equal-weighted (not mega-cap dominated) and time-local (no stale
+    # beta). The cheapest co-movement removal -- try this first. Composes with everything.
+    cross_sectional_demean: bool = False
+
+    # Spectral cleaning of the correlation matrix (eigenvalue cleaning / RMT). Uses a TRUNCATED
+    # eigensolver (top modes only) so it stays ~O(n^2 * k) -- far cheaper than a full eigen-
+    # decomposition or the Graphical Lasso.
+    #   "none"   -> raw correlation
+    #   "market" -> remove the top eigenmode (the market mode); the data-driven "remove SPY"
+    #   "topk"   -> remove the top `spectral_k` eigenmodes (market + a few super-sector modes)
+    #   "rmt"    -> keep ONLY the intermediate band: drop the top `spectral_k` mode(s) AND the
+    #               noise bulk below the Marchenko-Pastur edge lambda_+ = (1 + sqrt(n/T))^2,
+    #               reconstructing from the sector/sub-industry modes in between (Laloux/Bouchaud).
+    spectral_clean: str = "none"
+    spectral_k: int = 1
+
+    # Embedding family. The graph/matrix construction above is shared; only the embedding step
+    # changes. "node2vec" (default) = local random walks + skip-gram (EmbeddingTrainer). The
+    # alternatives live in benchmark/embedding_methods.py and exist so the paper's
+    # "does an embedding beat raw features?" question is asked of more than one method:
+    #   "spectral"    -> Laplacian Eigenmaps (global spectral geometry)
+    #   "netmf"       -> DeepWalk-as-matrix-factorization (closed-form skip-gram)
+    #   "raw_corr"    -> no embedding: a stock IS its correlation row
+    #   "raw_returns" -> no embedding: a stock IS its standardized return series
+    embedder: str = "node2vec"
 
     # Data Scope
     # Note: Will filter the provided CSV to this range ending at today.
@@ -122,6 +199,8 @@ class PineconeClient:
     def __init__(self, config: Config):
         self.config = config
         if not config.skip_pinecone:
+            from pinecone import Pinecone, ServerlessSpec  # optional extra
+            self._ServerlessSpec = ServerlessSpec
             self.pc = Pinecone(api_key=config.pinecone_api_key)
             self.index = self._get_or_create_index()
         else:
@@ -149,7 +228,7 @@ class PineconeClient:
                 name=self.config.index_name,
                 dimension=self.config.dimensions,
                 metric="cosine",
-                spec=ServerlessSpec(cloud="aws", region=self.config.cloud_region),
+                spec=self._ServerlessSpec(cloud="aws", region=self.config.cloud_region),
             )
             time.sleep(5) # Wait for creation to initialize
         
@@ -334,6 +413,14 @@ class GraphBuilder:
 
     def build(self, returns: pd.DataFrame) -> nx.Graph:
         """Builds graph based on Config filtering strategy (MST vs Threshold)."""
+        # 0. Co-movement removal preprocessing (optional), applied before the matrix so it
+        #    composes with whichever matrix is computed next. Cross-sectional demeaning is the
+        #    cheapest/best-behaved; market regression is the SPY/proxy beta version.
+        if self.config.cross_sectional_demean:
+            returns = self._cross_sectional_demean(returns)
+        if self.config.market_neutral:
+            returns = self._residualize_market(returns)
+
         G = nx.Graph()
         col_names = returns.columns
         G.add_nodes_from(col_names)
@@ -346,16 +433,24 @@ class GraphBuilder:
             print("🌲 Building Maximum Spanning Tree (MST)...")
 
             # --- MST/PMFG SPECIFIC LOGIC START ---
-            # Prepare all potential edges
+            # Prepare all potential edges. Two weightings:
+            #  * Distance-transform (mst_distance_transform): weight = signed correlation rho.
+            #    The MAXIMUM spanning tree on rho is identical to the MINIMUM spanning tree on
+            #    the Mantegna distance d = sqrt(2(1-rho)) (d is monotone decreasing in rho), so
+            #    strongly negative pairs are correctly treated as far apart.
+            #  * Default: weight = |corr| (optionally squared) to emphasize strong ties.
             all_edges = []
             for i in range(len(col_names)):
                 for j in range(i + 1, len(col_names)):
+                    if self.config.mst_distance_transform:
+                        w = float(matrix[i, j])  # signed rho
+                        if np.isfinite(w):
+                            all_edges.append((col_names[i], col_names[j], w))
+                        continue
                     w = np.abs(matrix[i, j])
-
                     # [MST OPTION] Squared Correlation
                     if self.config.mst_squared_corr:
                         w = w ** 2
-
                     if np.isfinite(w) and w > 1e-6:
                         all_edges.append((col_names[i], col_names[j], w))
 
@@ -395,34 +490,165 @@ class GraphBuilder:
                         G.add_edge(col_names[i], col_names[j], weight=float(w))
                         edge_count += 1
 
-            # Rescue islands
-            self._rescue_islands(G, matrix, col_names, returns)
-            print(f"🕸️  Graph (Threshold > {thresh}): {G.number_of_nodes()} nodes, {edge_count} edges")
+            # Forced Connectivity (the paper's contribution). Toggle off to get the
+            # plain-threshold-no-repair competitor baseline.
+            if self.config.repair_islands:
+                self._rescue_islands(G, matrix, col_names, returns)
+            repaired = " + repair" if self.config.repair_islands else " (no repair)"
+            print(f"🕸️  Graph (Threshold > {thresh}{repaired}): {G.number_of_nodes()} nodes, {edge_count} edges")
+
+        elif self.config.graph_filtering == "knn":
+            # kNN graph: connect each node to its K strongest-correlated peers (undirected
+            # union). The closest structural cousin to Forced Connectivity, and a standard
+            # competitor baseline.
+            k = self.config.knn_k
+            n = len(col_names)
+            k = min(k, n - 1)
+            abs_matrix = np.abs(np.nan_to_num(matrix))
+            np.fill_diagonal(abs_matrix, -np.inf)
+            for i in range(n):
+                # Top-k peers by |correlation| for node i
+                nbrs = np.argpartition(-abs_matrix[i], kth=k - 1)[:k]
+                for j in nbrs:
+                    w = float(abs_matrix[i, j])
+                    # Floor to a tiny positive weight: with a sparse matrix (e.g. Graphical
+                    # Lasso) a node can have fewer than k nonzero peers, leaving zero-weight
+                    # edges that make the Node2Vec walk sampler's weights sum to zero.
+                    w = max(w, 1e-8) if np.isfinite(w) else 1e-8
+                    G.add_edge(col_names[i], col_names[j], weight=w)
+            print(f"🕸️  Graph (kNN k={k}): {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+
         else:
             raise ValueError(f"Unknown graph filtering method: {self.config.graph_filtering}")
 
         return G
 
+    def _cross_sectional_demean(self, returns: pd.DataFrame) -> pd.DataFrame:
+        """Subtract each day's equal-weighted cross-sectional mean: r_i(t) -= mean_j r_j(t).
+
+        Removes the common daily move with no betas, no regression, no external index. O(n*T),
+        equal-weighted and time-local -- the cheapest co-movement removal.
+        """
+        print("🧹 Cross-sectional demeaning (equal-weighted daily mean removed)...")
+        return returns.sub(returns.mean(axis=1), axis=0)
+
+    def _spectral_clean(self, C: np.ndarray, returns: pd.DataFrame) -> np.ndarray:
+        """Eigenvalue (RMT) cleaning of the correlation matrix via a truncated top-mode solver.
+
+        Removes the market mode (and optionally a few super-sector modes), and for "rmt" keeps
+        only the band of eigenvalues above the Marchenko-Pastur noise edge. Result is renormalized
+        to a unit-diagonal correlation scale so the same edge thresholds apply.
+        """
+        method = self.config.spectral_clean
+        n = C.shape[0]
+        T = max(returns.shape[0], 1)
+        k = max(1, int(self.config.spectral_k))
+        n_top = int(min(max(k + 5, 40), n - 1))
+        if n_top < 1:
+            return C
+        Cf = C.astype(float)
+        try:
+            vals, vecs = eigsh(Cf, k=n_top, which="LA")  # top-mode only: ~O(n^2 * k)
+        except Exception:
+            vals, vecs = np.linalg.eigh(Cf)              # fallback (small n)
+        order = np.argsort(vals)[::-1]
+        vals, vecs = vals[order], vecs[:, order]
+        lam_plus = (1.0 + np.sqrt(n / T)) ** 2
+
+        if method in ("market", "topk"):
+            m = 1 if method == "market" else k
+            Cc = Cf - (vecs[:, :m] * vals[:m]) @ vecs[:, :m].T
+            tag = f"removed top {m} mode(s)"
+        elif method == "rmt":
+            band = [i for i in range(len(vals)) if i >= k and vals[i] > lam_plus]
+            if band:
+                V, L = vecs[:, band], vals[band]
+                Cc = (V * L) @ V.T
+                tag = f"kept {len(band)} band modes (lambda_+={lam_plus:.2f}, dropped top {k}+bulk)"
+            else:
+                Cc = Cf - (vecs[:, :k] * vals[:k]) @ vecs[:, :k].T
+                tag = f"no modes above lambda_+={lam_plus:.2f}; removed top {k}"
+        else:
+            return C
+
+        d = np.sqrt(np.clip(np.diag(Cc), 1e-12, None))
+        Cc = Cc / np.outer(d, d)        # renormalize to unit-diagonal correlation scale
+        np.fill_diagonal(Cc, 0.0)
+        print(f"   🧪 spectral clean [{method}]: {tag}")
+        return np.nan_to_num(Cc)
+
+    def _residualize_market(self, returns: pd.DataFrame) -> pd.DataFrame:
+        """Regress out the market factor from each stock's returns (market-neutral residuals).
+
+        For each stock r_i = alpha_i + beta_i * market + epsilon_i; we keep epsilon_i. The market
+        is the "SPY" column if present (then dropped, as it is the factor not a node), else the
+        equal-weighted average of all stocks. Vectorized OLS via demeaning: O(n*T), so it scales
+        to large universes -- the cheap alternative to Graphical Lasso for removing co-movement.
+        """
+        cols = list(returns.columns)
+        if "SPY" in cols:
+            market = returns["SPY"].to_numpy(dtype=float)
+            keep = [c for c in cols if c != "SPY"]
+            print("🧹 Market-neutral residualization (factor = SPY)...")
+        else:
+            market = returns.mean(axis=1).to_numpy(dtype=float)
+            keep = cols
+            print("🧹 Market-neutral residualization (factor = equal-weighted proxy; no SPY column)...")
+
+        R = returns[keep].to_numpy(dtype=float)
+        m = market - market.mean()
+        var = float(m @ m)
+        if var < 1e-12:
+            return returns[keep]
+        Rc = R - R.mean(axis=0)
+        betas = (Rc.T @ m) / var               # OLS slope per stock
+        resid = Rc - np.outer(m, betas)         # residual returns (alpha removed via demeaning)
+        return pd.DataFrame(resid, index=returns.index, columns=keep)
+
     def _compute_matrix(self, returns: pd.DataFrame) -> np.ndarray:
         if self.config.use_precision_matrix:
-            print("🧠 Computing precision matrix (GraphicalLasso)...")
+            n = returns.shape[1]
             try:
                 X = returns.values
                 stds = X.std(axis=0)
                 stds[stds == 0] = 1e-8
                 X_norm = (X - X.mean(axis=0)) / stds
-                model = GraphicalLassoCV(max_iter=1000).fit(X_norm)
-                return np.nan_to_num(model.precision_)
+                if self.config.lasso_alpha > 0:
+                    print(f"🧠 GraphicalLasso (alpha={self.config.lasso_alpha}) on "
+                          f"{n} nodes, T={X.shape[0]}...")
+                    model = GraphicalLasso(alpha=self.config.lasso_alpha, max_iter=200).fit(X_norm)
+                else:
+                    print(f"🧠 GraphicalLassoCV on {n} nodes, T={X.shape[0]} "
+                          f"(slow CV; set lasso_alpha>0 to skip)...")
+                    model = GraphicalLassoCV(max_iter=200).fit(X_norm)
+                # Normalize precision -> partial correlation: bounded in [-1, 1] and
+                # sign-correct, so the same `correlation_threshold`/edge-weight scale applies.
+                # (The raw precision matrix has a different, unbounded scale -- thresholding it
+                # at a correlation-style value silently produces an empty graph.)
+                P = model.precision_
+                dinv = 1.0 / np.sqrt(np.clip(np.diag(P), 1e-12, None))
+                pcorr = -P * np.outer(dinv, dinv)
+                np.fill_diagonal(pcorr, 0.0)
+                # Partial correlations live in [-1, 1]; clip to guard against blow-ups from a
+                # near-zero precision diagonal (which would otherwise create non-finite edge
+                # weights and crash the Node2Vec walk sampler).
+                pcorr = np.nan_to_num(pcorr, nan=0.0, posinf=1.0, neginf=-1.0)
+                return np.clip(pcorr, -1.0, 1.0)
             except Exception as e:
                 print(f"⚠️  Lasso failed ({e}), using correlation")
 
         print("🔗 Computing correlation matrix...")
-        return np.nan_to_num(returns.corr().values)
+        C = np.nan_to_num(returns.corr().values)
+        if self.config.spectral_clean != "none":
+            C = self._spectral_clean(C, returns)
+        return C
 
     def _rescue_islands(self, G, matrix, col_names, returns):
         """
-        Ensures every node has at least 3 edges by connecting to strongest available neighbors.
+        Forced Connectivity: ensure every node has at least `min_degree` edges by
+        connecting it to its strongest available neighbors.
         """
+        min_degree = self.config.min_degree
         corr_matrix = None  # Lazy computation
         added_edges_count = 0
 
@@ -430,13 +656,13 @@ class GraphBuilder:
         node_to_idx = {name: i for i, name in enumerate(col_names)}
         all_nodes_indices = set(range(len(col_names)))
 
-        print("   🔧 Ensuring minimum connectivity (degree >= 3)...")
+        print(f"   🔧 Ensuring minimum connectivity (degree >= {min_degree})...")
 
         for node in list(G.nodes()):
             idx = node_to_idx[node]
 
-            # We loop until degree is at least 3
-            while G.degree(node) < 3:
+            # We loop until degree is at least min_degree
+            while G.degree(node) < min_degree:
                 # Identify who we are already connected to
                 current_neighbors = list(G.neighbors(node))
                 # Get their indices
@@ -477,7 +703,7 @@ class GraphBuilder:
                 added_edges_count += 1
                 
         if added_edges_count > 0:
-            print(f"   ⛑️  Added {added_edges_count} edges to ensure min degree >= 3.")
+            print(f"   ⛑️  Added {added_edges_count} edges to ensure min degree >= {min_degree}.")
 
 
 # =============================================================================
@@ -489,7 +715,8 @@ class EmbeddingTrainer:
 
     def train(self, G: nx.Graph) -> dict[str, list[float]]:
         p, q = self.config.walk_p, self.config.walk_q
-        print(f"🏋️  Training Node2Vec (p={p}, q={q}, dim={self.config.dimensions})...")
+        seed = self.config.seed
+        print(f"🏋️  Training Node2Vec (p={p}, q={q}, dim={self.config.dimensions}, seed={seed})...")
 
         isolates = list(nx.isolates(G))
         if isolates:
@@ -498,11 +725,15 @@ class EmbeddingTrainer:
 
         if not G.nodes(): return {}
 
+        # Seed every source of randomness. workers=1 is required for gensim Word2Vec
+        # determinism (multi-worker training is non-deterministic regardless of seed).
+        np.random.seed(seed)
         n2v = Node2Vec(
-            G, dimensions=self.config.dimensions, walk_length=20, num_walks=100,
-            p=p, q=q, workers=1, quiet=True
+            G, dimensions=self.config.dimensions,
+            walk_length=self.config.walk_length, num_walks=self.config.num_walks,
+            p=p, q=q, workers=1, quiet=True, seed=seed
         )
-        model = n2v.fit(window=10, min_count=1)
+        model = n2v.fit(window=self.config.window, min_count=1, seed=seed)
 
         return {t: model.wv[t].tolist() for t in model.wv.index_to_key}
 

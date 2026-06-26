@@ -1,0 +1,44 @@
+# ---- Secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---- Virtual environments ----
+venv/
+.venv/
+env/
+
+# ---- Data (large / regenerable; see jobs/ and README) ----
+data/*.csv
+data/outputs/
+data/sector_composite_vectors.csv
+# raw Kaggle download (huge prices CSV); distilled via jobs/prep_kaggle_data.py
+data/kaggle_raw/
+# reconstructed Dolphin 611-stock benchmark files
+data/dolphin/
+*.npy
+# Keep the small reference files needed to build GICS labels out-of-the-box:
+#   - gics_hierarchy.csv: hand-built sub-industry -> sector rollup (jobs/build_gics_hierarchy.py)
+#   - Holdings_details_Russell_3000_ETF.csv: iShares IWV holdings (ticker -> sub-industry), ~278KB
+# The large *price* CSVs stay ignored and are regenerated via jobs/fetch_prices.py.
+!data/gics_hierarchy.csv
+!data/Holdings_details_Russell_3000_ETF.csv
+
+# ---- Generated outputs ----
+reports/
+results/
+
+# ---- Retired legacy/product code (kept locally, not published) ----
+trash/
+
+# ---- Editors / OS ----
+.idea/
+.vscode/
+.DS_Store

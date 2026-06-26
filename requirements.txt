@@ -1,8 +1,17 @@
-scikit-learn
-numpy
-pandas
-networkx
-requests
-python-dotenv
-node2vec
-pinecone
+# Core research / benchmark dependencies (pinned to tested versions).
+# These are all that's needed to run the benchmark in benchmark/ and the jobs/ scripts.
+numpy==1.26.4
+pandas==2.0.3
+networkx==3.1
+scikit-learn==1.7.1
+scipy==1.13.0
+gensim==4.4.0
+node2vec==0.5.0
+python-louvain==0.16          # imported as `community` (used by metrics.py)
+tqdm==4.67.1
+requests==2.32.3              # data fetching (jobs/fetch_prices.py, test_gics.py)
+python-dotenv==1.0.1          # loads .env for API keys
+
+# --- Optional extras ---
+# Cloud sweeps (modal_app.py):            pip install modal
+# Legacy Pinecone-backed scripts:         pip install pinecone
