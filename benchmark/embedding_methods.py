@@ -2,8 +2,8 @@
 Embedding families beyond Node2Vec -- so the paper's "does an embedding beat raw features?"
 question is asked of more than one method.
 
-Node2Vec is *one* point in a large design space (random-walk sampling + skip-gram). If only
-Node2Vec is tested, "embeddings don't beat raw features" is really "*Node2Vec* doesn't". This
+Node2Vec is one point in a large design space (random-walk sampling + skip-gram). If only
+Node2Vec is tested, "embeddings don't beat raw features" is really "Node2Vec doesn't". This
 module adds three structurally different representations that all emit the SAME
 `{ticker: vector}` dict the rest of the harness consumes, so hit-rate / SVM-F1 / V-measure /
 significance all score them unchanged:

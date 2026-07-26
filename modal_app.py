@@ -603,3 +603,437 @@ def pq_sweep(
         vals = df[f"{metric}_mean"]
         print(f"  range across grid: {vals.min():.3f}–{vals.max():.3f}  (spread {vals.max()-vals.min():.3f})")
     print(f"\n📝 Saved {outp}")
+
+
+# ---------------------------------------------------------------------------
+# Temporal / out-of-sample sweep (rolling train/test windows across universes)
+# ---------------------------------------------------------------------------
+
+
+@app.function(cpu=CONTAINER_CPU, memory=CONTAINER_MEMORY, gpu=GPU, timeout=60 * 60)
+def evaluate_temporal_window(payload: dict) -> dict:
+    """Run all embedding methods + baselines on one rolling train/test window.
+
+    Loads the full price panel inside the container, generates the requested
+    window, then calls ``_run_window`` which trains every method (node2vec,
+    spectral, netmf, raw_corr, raw_returns + corr_direct null + oracle ceiling)
+    on the train half and measures both in-sample and out-of-sample metrics.
+    """
+    import sys
+    sys.path.insert(0, "/root/app")
+    os.chdir("/root/app")
+    import numpy as np
+    from benchmark.temporal_validation import load_prices, generate_windows, _run_window
+    from benchmark.run_benchmark import RunSpec, _parse_seeds
+    from benchmark.labels import load_all_levels
+
+    universe = payload["universe"]
+    period = payload["period"]
+    train_period = payload["train_period"]
+    test_horizon = payload["test_horizon"]
+    num_windows = payload["num_windows"]
+    window_index = payload["window_index"]
+    dimensions = payload["dimensions"]
+    k = payload["k"]
+
+    prices = load_prices(universe, period)
+    try:
+        windows = generate_windows(prices, train_period, test_horizon, num_windows)
+    except ValueError as e:
+        return {"rows": [], "skipped": True, "reason": str(e)}
+
+    ret_train, ret_test, label, train_end, test_end = windows[window_index]
+
+    labels_all = load_all_levels()
+    sub_labels = labels_all["sub_industry"]
+    tickers = [t for t in ret_train.columns if t in ret_test.columns and t in sub_labels]
+    if len(tickers) < 50:
+        return {"rows": [], "skipped": True, "reason": f"only {len(tickers)} common tickers"}
+
+    ret_train_s = ret_train[tickers]
+    ret_test_s = ret_test[tickers]
+    label_arr = np.asarray([sub_labels[t] for t in tickers], dtype=object)
+
+    seed_list = _parse_seeds(payload["seeds"])
+
+    def spec(embedder: str) -> RunSpec:
+        return RunSpec(
+            method=embedder, universe=universe, period=period,
+            embedder=embedder, graph_mode="knn", knn_k=10,
+            dimensions=dimensions,
+        )
+
+    rows = _run_window(
+        ret_train_s, ret_test_s, label, train_end, test_end,
+        spec, seed_list, k, label_arr, tickers,
+    )
+    for r in rows:
+        r["train_period"] = train_period
+        r["test_horizon"] = test_horizon
+        r["universe"] = universe
+    return {"rows": rows, "skipped": False}
+
+
+def _load_existing_temporal(results_dir: str = "results") -> list[dict]:
+    """Load and normalize all existing temporal CSV results into a unified row format.
+
+    Handles two schemas:
+      * New per-window format: temporal_{u}_{p}_per_window.csv with gics_hit3_train/test
+      * Old single-split format: temporal_{u}_{p}.csv with gics_hit3_A/B
+    """
+    import glob
+    import pandas as pd
+    import os
+
+    rows: list[dict] = []
+
+    # New-format per-window files
+    for path in sorted(glob.glob(os.path.join(results_dir, "temporal_*_per_window.csv"))):
+        fname = os.path.basename(path)
+        # Extract universe from filename: temporal_{universe}_{period}_per_window.csv
+        parts = fname.replace("temporal_", "").replace("_per_window.csv", "").rsplit("_", 1)
+        universe = parts[0] if len(parts) == 2 else "unknown"
+        df = pd.read_csv(path)
+        df["universe"] = universe
+        for _, r in df.iterrows():
+            rows.append(r.to_dict())
+
+    # Old-format single-split files (gics_hit3_A/B → train/test)
+    for path in sorted(glob.glob(os.path.join(results_dir, "temporal_*_5y.csv"))):
+        fname = os.path.basename(path)
+        if "per_window" in fname or "aggregate" in fname:
+            continue
+        # temporal_{universe}_5y.csv
+        universe = fname.replace("temporal_", "").replace("_5y.csv", "")
+        df = pd.read_csv(path)
+        for _, r in df.iterrows():
+            row = {
+                "method": r["method"],
+                "future_corr": r.get("future_corr"),
+                "insample_corr": r.get("insample_corr"),
+                "gics_hit3_train": r.get("gics_hit3_A"),
+                "gics_hit3_test": r.get("gics_hit3_B"),
+                "window": "split_half",
+                "train_end": "",
+                "test_end": "",
+                "train_period": "half",
+                "test_horizon": "half",
+                "retention": r.get("retention"),
+                "universe": universe,
+            }
+            rows.append(row)
+
+    return rows
+
+
+@app.local_entrypoint()
+def temporal(
+    universes: str = "sp500,r1000,r3000",
+    period: str = "5y",
+    train_periods: str = "0.5y,1y,2y",
+    test_horizons: str = "0.5y,1y,2y",
+    num_windows: int = 5,
+    seeds: str = "0-4",
+    dimensions: int = 64,
+    k: int = 3,
+    out: str = "results/temporal_sweep",
+):
+    """Full temporal / out-of-sample sweep across all universes on Modal.
+
+    Loads existing temporal results from ``results/temporal_*`` CSVs and only
+    dispatches the **missing** (universe, train-period, test-horizon) configs to
+    Modal.  Each container trains every embedding family (node2vec, spectral,
+    netmf, raw_corr, raw_returns) plus the corr-direct null and oracle ceiling,
+    measuring in-sample GICS hit@3, out-of-sample GICS hit@3, in-sample
+    correlation, and realised future correlation.
+
+        modal run modal_app.py::temporal
+        modal run modal_app.py::temporal --universes sp500 --train-periods 1y --test-horizons 1y
+    """
+    import numpy as np
+    import pandas as pd
+    from collections import defaultdict
+
+    uni_list = [u.strip() for u in universes.split(",") if u.strip()]
+    tp_list = [p.strip() for p in train_periods.split(",") if p.strip()]
+    th_list = [h.strip() for h in test_horizons.split(",") if h.strip()]
+
+    # --- 1. Load existing results and determine covered configs ---
+    existing_rows = _load_existing_temporal()
+    covered: set[tuple[str, str, str]] = set()
+    for r in existing_rows:
+        covered.add((r.get("universe", ""), r["train_period"], r["test_horizon"]))
+    if covered:
+        print(f"📂 Existing temporal results: {len(existing_rows)} rows covering {len(covered)} configs:")
+        for u, tp, th in sorted(covered):
+            print(f"   ✓ {u}  train={tp}  test={th}")
+
+    # --- 2. Build payloads for MISSING configs only ---
+    all_configs = [(u, tp, th) for u in uni_list for tp in tp_list for th in th_list]
+    missing = [c for c in all_configs if c not in covered]
+    if not missing:
+        print("\n✅ All requested configs already have results. Nothing to dispatch to Modal.")
+    else:
+        print(f"\n📋 Missing configs to compute ({len(missing)}):")
+        for u, tp, th in missing:
+            print(f"   • {u}  train={tp}  test={th}")
+
+    payloads = []
+    for u, tp, th in missing:
+        for wi in range(num_windows):
+            payloads.append({
+                "universe": u, "period": period,
+                "train_period": tp, "test_horizon": th,
+                "num_windows": num_windows, "window_index": wi,
+                "seeds": seeds, "dimensions": dimensions, "k": k,
+            })
+
+    # --- 3. Dispatch missing configs to Modal ---
+    new_rows: list[dict] = []
+    skipped = 0
+    if payloads:
+        print(f"\n🚀 Dispatching {len(payloads)} temporal-window tasks to Modal...")
+        print(f"   {len(missing)} configs × {num_windows} windows = {len(payloads)} containers")
+        results = list(evaluate_temporal_window.map(payloads))
+        for r in results:
+            if r.get("skipped"):
+                skipped += 1
+                print(f"  SKIP: {r.get('reason', '?')}")
+                continue
+            new_rows.extend(r["rows"])
+
+    # --- 4. Merge existing + new ---
+    all_rows = existing_rows + new_rows
+    if not all_rows:
+        print("No valid rows. Check that train+test ≤ available history.")
+        return
+
+    df = pd.DataFrame(all_rows)
+    df["retention"] = df["future_corr"] / df["insample_corr"]
+
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    per_window_path = f"{out}_per_window.csv"
+    aggregate_path = f"{out}_aggregate.csv"
+    df.to_csv(per_window_path, index=False)
+
+    # --- 5. Aggregate by (universe, train_period, test_horizon, method) ---
+    records: dict = defaultdict(list)
+    for r in all_rows:
+        key = (r.get("universe", ""), r["train_period"], r["test_horizon"], r["method"])
+        records[key].append(r)
+
+    agg_rows = []
+    for (uni, tp, th, method), recs in sorted(records.items()):
+        row: dict = {"universe": uni, "train_period": tp, "test_horizon": th, "method": method}
+        for metric in ["future_corr", "insample_corr", "gics_hit3_train", "gics_hit3_test"]:
+            vals = [r[metric] for r in recs
+                    if r.get(metric) is not None
+                    and not (isinstance(r.get(metric), float) and np.isnan(r[metric]))]
+            if vals:
+                row[f"{metric}_mean"] = float(np.mean(vals))
+                row[f"{metric}_std"] = float(np.std(vals))
+                row[f"{metric}_n"] = len(vals)
+            else:
+                row[f"{metric}_mean"] = float("nan")
+                row[f"{metric}_std"] = float("nan")
+                row[f"{metric}_n"] = 0
+        agg_rows.append(row)
+
+    agg = pd.DataFrame(agg_rows)
+    agg.to_csv(aggregate_path, index=False)
+
+    # --- 6. Print detailed per-config tables ---
+    for uni in uni_list:
+        for tp in tp_list + (["half"] if any(c[1] == "half" for c in covered) else []):
+            for th in th_list + (["half"] if any(c[2] == "half" for c in covered) else []):
+                sub = agg[(agg.universe == uni)
+                          & (agg.train_period == tp)
+                          & (agg.test_horizon == th)]
+                if sub.empty:
+                    continue
+                src = "existing" if (uni, tp, th) in covered else "NEW"
+                print(f"\n{'='*100}")
+                print(f"TEMPORAL SWEEP  |  {uni}/{period}  train={tp}  test={th}  k={k}  [{src}]")
+                print(f"{'='*100}")
+                print(f"{'method':20} {'hit@3 train':>14} {'hit@3 test':>14} "
+                      f"{'insample ρ':>11} {'future ρ':>10} {'retention':>10}")
+                print("-" * 100)
+                for _, r in sub.iterrows():
+                    def f(x, w=12, p=3):
+                        return f"{x:>{w}.{p}f}" if pd.notna(x) else f"{'—':>{w}}"
+                    ins = r['insample_corr_mean']
+                    ret = r['future_corr_mean'] / ins if pd.notna(ins) and ins != 0 else float('nan')
+                    print(f"{r['method']:20} "
+                          f"{f(r['gics_hit3_train_mean'])} ±{f(r['gics_hit3_train_std'], 5, 3)} "
+                          f"{f(r['gics_hit3_test_mean'])} ±{f(r['gics_hit3_test_std'], 5, 3)} "
+                          f"{f(ins, 11)} {f(r['future_corr_mean'], 10)} "
+                          f"{f(ret, 10)}")
+                print("-" * 100)
+
+    # --- 7. Cross-config summaries ---
+    print(f"\n{'='*100}")
+    print("CROSS-CONFIG SUMMARY  —  GICS hit@3 (test) by method × train-period")
+    print(f"{'='*100}")
+    piv = agg.pivot_table(
+        index="method", columns="train_period",
+        values="gics_hit3_test_mean", aggfunc="mean",
+    )
+    print(piv.round(3).to_string())
+
+    print(f"\nCROSS-CONFIG SUMMARY  —  future ρ by method × train-period")
+    piv2 = agg.pivot_table(
+        index="method", columns="train_period",
+        values="future_corr_mean", aggfunc="mean",
+    )
+    print(piv2.round(3).to_string())
+
+    print(f"\nCROSS-CONFIG SUMMARY  —  GICS hit@3 (test) by method × universe")
+    piv3 = agg.pivot_table(
+        index="method", columns="universe",
+        values="gics_hit3_test_mean", aggfunc="mean",
+    )
+    print(piv3.round(3).to_string())
+
+    n_existing = len(existing_rows)
+    n_new = len(new_rows)
+    if skipped:
+        print(f"\n⚠️  {skipped} window(s) skipped (insufficient history or tickers)")
+    print(f"\n📝 Per-window rows: {per_window_path}  ({len(df)} rows: {n_existing} existing + {n_new} new)")
+    print(f"📝 Aggregate rows:  {aggregate_path}  ({len(agg)} rows)")
+
+
+# ---------------------------------------------------------------------------
+# Hedging / OOS risk experiment (portfolio-level significance)
+# ---------------------------------------------------------------------------
+
+
+@app.function(cpu=CONTAINER_CPU, memory=CONTAINER_MEMORY, gpu=GPU, timeout=60 * 60)
+def evaluate_hedging_window(payload: dict) -> dict:
+    """Run one rolling train/test window for the hedging experiment on Modal."""
+    import sys
+
+    sys.path.insert(0, "/root/app")
+    os.chdir("/root/app")
+    from benchmark.hedging_experiment import evaluate_hedging_window as _eval_hedging_window
+
+    return _eval_hedging_window(payload)
+
+
+@app.local_entrypoint()
+def hedging(
+    universes: str = "sp500,r1000,r3000",
+    period: str = "5y",
+    train_period: str = "1y",
+    test_horizon: str = "1y",
+    num_windows: int = 5,
+    seeds: str = "0-4",
+    dimensions: int = 64,
+    k: int = 5,
+    out: str = "results/hedging_modal",
+):
+    """Fan the OOS hedging/risk experiment out across Modal containers (one per window-seed).
+
+    Each container runs one rolling window and one seed for one universe.  Splitting by
+    seed maximises parallelism: up to ``num_windows × len(seeds)`` containers per
+    universe.  The local entrypoint collects per-window aggregates and per-stock records,
+    then runs the paired Wilcoxon + bootstrap CI significance machinery vs the
+    raw_returns baseline.
+
+        modal run modal_app.py::hedging --universes r3000 --seeds 0-4 --k 5
+    """
+    import numpy as np
+    import pandas as pd
+
+    from benchmark.run_benchmark import _parse_seeds
+    from benchmark.hedging_experiment import compute_significance
+
+    uni_list = [u.strip() for u in universes.split(",") if u.strip()]
+    seed_list = _parse_seeds(seeds)
+
+    payloads = []
+    for u in uni_list:
+        for wi in range(num_windows):
+            for s in seed_list:
+                payloads.append({
+                    "universe": u, "period": period,
+                    "train_period": train_period, "test_horizon": test_horizon,
+                    "num_windows": num_windows, "window_index": wi,
+                    "seed": s, "dimensions": dimensions, "k": k,
+                })
+
+    print(f"🚀 Dispatching {len(payloads)} hedging-window-seed tasks to Modal...")
+    results = list(evaluate_hedging_window.map(payloads))
+
+    all_rows = []
+    all_per_stock = []
+    skipped = 0
+    for r in results:
+        if r.get("skipped"):
+            skipped += 1
+            print(f"  SKIP {r.get('universe', '?')}: {r.get('reason', '?')}")
+            continue
+        all_rows.extend(r["rows"])
+        all_per_stock.extend(r["per_stock"])
+
+    if not all_rows:
+        print("No valid rows. Check train+test ≤ available history.")
+        return
+
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    per_window_path = f"{out}_per_window.csv"
+    per_stock_path = f"{out}_per_stock.csv"
+    aggregate_path = f"{out}_aggregate.csv"
+    significance_path = f"{out}_significance.csv"
+
+    df = pd.DataFrame(all_rows)
+    df.to_csv(per_window_path, index=False)
+
+    per_stock_df = pd.DataFrame(all_per_stock)
+    per_stock_df.to_csv(per_stock_path, index=False)
+
+    records: dict = {}
+    for r in all_rows:
+        key = (r["universe"], r["method"])
+        records.setdefault(key, []).append(r)
+    agg_rows = []
+    for (uni, method), recs in records.items():
+        row = {"universe": uni, "method": method}
+        for metric in ["vol_hedged_mean", "vol_hedged_median", "vol_reduction_mean", "vol_reduction_median"]:
+            vals = [r[metric] for r in recs if not np.isnan(r[metric])]
+            row[f"{metric}_mean"] = float(np.mean(vals)) if vals else float("nan")
+            row[f"{metric}_std"] = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+        agg_rows.append(row)
+    agg = pd.DataFrame(agg_rows)
+    agg.to_csv(aggregate_path, index=False)
+
+    sig_df = compute_significance(per_stock_df, baseline="raw_returns")
+    if not sig_df.empty:
+        sig_df.to_csv(significance_path, index=False)
+
+    print(f"\n{'='*100}")
+    print(f"HEDGING / OOS RISK  (Modal)  |  k={k}  train={train_period}  test={test_horizon}")
+    print(f"{'='*100}")
+    print(f"{'universe':10} {'method':16} {'hedged vol mean':>16} {'hedged vol median':>18} {'risk reduction':>16}")
+    print("-" * 100)
+    for _, r in agg.iterrows():
+        def f(x, w=12, p=2):
+            return f"{x:>{w}.{p}f}" if pd.notna(x) else f"{'—':>{w}}"
+        print(f"{r['universe']:10} {r['method']:16} "
+              f"{f(r['vol_hedged_mean_mean'], 16)} "
+              f"{f(r['vol_hedged_median_mean'], 18)} "
+              f"{f(r['vol_reduction_mean_mean'], 16)}")
+    print("-" * 100)
+    if not sig_df.empty:
+        print("\nPaired Wilcoxon vs raw_returns baseline (per-stock hedged vol):")
+        print(f"{'universe':10} {'method':12} {'delta':>10} {'p (BH)':>10} {'CI95':>24} {'n':>10}")
+        print("-" * 80)
+        for _, r in sig_df.iterrows():
+            ci = f"[{r['ci_low']:+.4f}, {r['ci_high']:+.4f}]"
+            print(f"{r['universe']:10} {r['method']:12} {r['delta_mean']:>10.4f} {r['p_bh']:>10.4f} {ci:>24} {r['n']:>10}")
+        print("-" * 80)
+    if skipped:
+        print(f"\n⚠️  {skipped} window(s) skipped")
+    print(f"\n📝 Per-window rows:   {per_window_path}")
+    print(f"📝 Per-stock rows:    {per_stock_path}")
+    print(f"📝 Aggregate rows:    {aggregate_path}")
+    print(f"📝 Significance rows: {significance_path}")

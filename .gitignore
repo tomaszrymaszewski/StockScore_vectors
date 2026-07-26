@@ -33,7 +33,7 @@ data/dolphin/
 
 # ---- Generated outputs ----
 reports/
-results/
+results/vectors/
 
 # ---- Retired legacy/product code (kept locally, not published) ----
 trash/
@@ -42,3 +42,7 @@ trash/
 .idea/
 .vscode/
 .DS_Store
+/README.pdf
+/RESULTS.pdf
+/Paper.md
+/results/temporal_sweep.log

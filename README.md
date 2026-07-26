@@ -24,7 +24,73 @@ fraction share its GICS label. Reported at four granularities:
 | `sub_industry`   | 159       | the fine-grained target where the method's value shows |
 
 Metrics: **hit-rate@k**, success@k, and MRR for `k ∈ {1,3,5,10}`, plus clustering-agreement
-(V-measure / NMI / ARI) to compare against prior work.
+(V-measure / NMI / ARI) to compare against prior work. The benchmark also includes a simple
+out-of-sample **hedging / risk** test: short a stock's k nearest peers (selected on the train window)
+and measure the realised residual volatility in the test window.
+
+---
+
+## How this repo is organized — start here
+
+**Two documents.** This README is the *how-to + map of the code*. [RESULTS.md](RESULTS.md) is the
+*findings*: every empirical claim, seed-averaged and significance-tested, each tagged with the
+script that produces it. If you want to know "what did they find and is it sound", read RESULTS.md;
+if you want "how do I run X / where does Y live", stay here.
+
+**One data flow, reused by every experiment.** Each experiment is the *same* pipeline with exactly
+one stage swapped out:
+
+```
+ price CSV  ─▶  returns  ─▶  relationship matrix  ─▶  graph  ─▶  embedding  ─▶  {ticker: vector}  ─▶  metrics
+ data/*.csv     DataFetcher    GraphBuilder            GraphBuilder  EmbeddingTrainer  (a plain dict)     evaluation.py
+ (built by      .fetch_returns ._compute_matrix        .build        /                                   clustering_metrics.py
+  jobs/)                       (corr·demean·market_     (threshold·   embedding_methods                   classification_metrics.py
+                               neutral·pca·rmt·lasso)   mst·knn·FC)   .build_embeddings                   significance.py
+```
+
+The **representation is always a plain `{ticker: [floats]}` dict**, so Node2Vec embeddings, the
+other embedding families, the raw-feature baselines, and every competitor graph all score through
+the *identical* metric + significance code — differences reflect the method, not the measurement.
+Trained vector spaces are saved to `results/vectors/*.json`; every metric can be recomputed from
+them without retraining.
+
+**Where to find what:**
+
+| You want to… | File | Key symbol |
+|---|---|---|
+| **— building blocks —** | | |
+| see/limit every knob (graph, matrix, embedder, walk params, seed) | `train_vectors.py` | `Config` |
+| compute the relationship matrix (corr · demean · market-neutral · PCA-market · RMT · lasso) | `train_vectors.py` | `GraphBuilder._compute_matrix`, `_spectral_clean`, `_residualize_market`, `_cross_sectional_demean` |
+| filter it into a graph (threshold · MST · kNN · forced-connectivity repair) | `train_vectors.py` | `GraphBuilder.build`, `_rescue_islands` |
+| train the Node2Vec embedding | `train_vectors.py` | `EmbeddingTrainer.train` |
+| pick an embedding family (node2vec · spectral · netmf · contrastive · raw_corr · raw_returns) | `benchmark/embedding_methods.py` | `build_embeddings` (dispatcher) |
+| Dolphin's contrastive method, reimplemented (NumPy, no torch) | `benchmark/contrastive_embedding.py` | `train_contrastive_embedding` |
+| describe one benchmark config (everything except the seed) | `benchmark/run_benchmark.py` | `RunSpec`, `.to_config` |
+| load GICS labels at all 4 granularities | `benchmark/labels.py` | `load_all_levels` |
+| **— metrics —** | | |
+| retrieval: hit-rate@k, success@k, MRR (the headline metric) | `benchmark/evaluation.py` | `neighbor_match_frame`, `metric_bundle` |
+| clustering: V-measure / NMI / ARI (Sarmah's language) | `benchmark/clustering_metrics.py` | `clustering_metrics` |
+| supervised: SVM 5-fold sector F1 (Dolphin's protocol) | `benchmark/classification_metrics.py` | `svm_classification` |
+| significance: paired Wilcoxon / McNemar / bootstrap CI / Holm·BH-FDR | `benchmark/significance.py` | `compare_methods`, `wilcoxon_compare` |
+| save a vector space / score a saved one (no retraining) | `benchmark/build_vectors.py` · `stats_from_vectors.py` | CLIs |
+| **— the experiments (→ RESULTS.md section) —** | | |
+| graph-construction & co-movement sweep (§3, §4) | `benchmark/run_benchmark.py`, `benchmark/lasso_experiment.py` | `competitor_specs`, `comovement_specs` |
+| metric-disagreement under universe expansion (§5) | `benchmark/run_benchmark.py` + `literature_comparison.py` | — |
+| against the literature: Dolphin SVM-sector (§6b) | `benchmark/dolphin_benchmark.py` | `METHOD_FLAGS`, `evaluate` |
+| reproduce Sarmah's V-measure (§6a) | `benchmark/reproduce_sarmah.py` | CLI |
+| improve on Sarmah's exact network (§6a-bis) | `benchmark/sarmah_improvements.py` | `METHODS` |
+| **does any embedding family beat raw features? (§6d)** | `benchmark/embedding_families.py` | `run_family`, `score_embedding`, `summarize` |
+| **temporal / out-of-sample robustness (§6e)** | `benchmark/temporal_validation.py` | `main`, `mean_future_corr` |
+| **out-of-sample hedging / risk (§6g)** | `benchmark/hedging_experiment.py` | `main`, `evaluate_hedging_window` |
+| **dimension & Node2Vec p/q ablations (§6f)** | `modal_app.py` | `dim_sweep`, `pq_sweep` |
+| universe/size confound | `benchmark/matched_sampling.py` | `run_matched_node_count` |
+| literature metrics over every saved vector space | `benchmark/literature_comparison.py` | CLI |
+| **— infrastructure —** | | |
+| fan any sweep out across cloud containers | `modal_app.py` | entrypoints (see "Modal entrypoints" below) |
+| (re)build the data (prices · Kaggle/Dolphin set · GICS rollup) | `jobs/` | `fetch_prices`, `prep_kaggle_data`, `build_gics_hierarchy` |
+
+The full annotated file tree, the `Config` knob reference, and the method/metric vocabularies are at
+the bottom under **[Repository layout](#repository-layout)**.
 
 ## Install
 
@@ -35,18 +101,33 @@ pip install -r requirements.txt
 
 ## Data
 
-Large price CSVs are **not committed** (gitignored). Two small reference files *are* in the
-repo so labels work out of the box:
+**What's committed vs not.** Large price CSVs are **gitignored** (regenerable). Two small reference
+files *are* committed so GICS labels work out of the box:
 
 - `data/gics_hierarchy.csv` — sub-industry → industry → industry group → sector rollup.
   Rebuild/validate with `python -m jobs.build_gics_hierarchy`.
-- `data/Holdings_details_Russell_3000_ETF.csv` — iShares IWV holdings (ticker → sub-industry).
+- `data/Holdings_details_Russell_3000_ETF.csv` — iShares IWV holdings (ticker → GICS sub-industry);
+  the source of truth for labels (`benchmark/labels.py`).
 
-Regenerate the price history (needs `POLYGON_API_KEY`; copy `.env.example` → `.env`):
+**Universes & periods.** A universe×period is a price panel `data/<universe>_<period>.csv`
+(rows = dates, cols = tickers), sliced to a trailing window ending at `Config.cutoff_date`:
+
+| universe arg | file prefix | ~stocks | source |
+|---|---|---|---|
+| `sp500` | `data/sp500_*.csv` | ~470 (large-cap core) | Polygon (`jobs/fetch_prices.py`) |
+| `r1000` | `data/russell_1000_*.csv` | ~880 | Polygon |
+| `r3000` | `data/russell_3000_*.csv` | ~2,180 | Polygon |
+| Dolphin set | `data/dolphin/returns_df_611.csv` | ~1,113 full-survivors, 2000–2018 | Kaggle (`jobs/prep_kaggle_data.py`) |
+| Sarmah net | `data/sarmah_2017_returns.csv` | 504, 2017 log returns | Kaggle |
+
+Periods are `0.5y · 1y · 2y · 5y`. Regenerate the price history (needs `POLYGON_API_KEY`; copy
+`.env.example` → `.env`):
 
 ```bash
 python -m jobs.fetch_prices --universe r3000 --period 2y
 python -m jobs.fetch_prices --universe sp500 --period 5y
+# Dolphin/Kaggle benchmark set (no API key; needs the Kaggle dump in data/kaggle_raw/):
+python -m jobs.prep_kaggle_data --min-coverage 1.0 --dolphin
 ```
 
 ## Run the benchmark
@@ -88,12 +169,24 @@ McNemar between the two files.
 
 ### At cloud scale (Modal)
 
-The sweep is embarrassingly parallel over (method × seed). Run it across containers:
+The sweep is embarrassingly parallel over (method × seed). Run it across containers. `modal_app.py`
+exposes one entrypoint per experiment — pass the entrypoint after `::`:
 
 ```bash
 pip install modal && modal token new
-modal run modal_app.py --universe r3000 --period 2y --seeds 0-19 --methods all
+# Graph-construction OR co-movement sweep (saves vectorspaces + a metrics CSV):
+modal run modal_app.py::main --suite comovement --universe r3000 --period 5y --seeds 0-19
+# Other experiments:
+modal run modal_app.py::families  --universes sp500,r1000,r3000 --seeds 0-4   # §6d embedding families
+modal run modal_app.py::dolphin   --seeds 0-4                                 # §6b Dolphin SVM-sector
+modal run modal_app.py::dim_sweep --universe sp500 --dims 8,16,32,64,128      # §6f dimension sweep
+modal run modal_app.py::pq_sweep  --universe sp500                            # §6f Node2Vec p/q
+modal run modal_app.py::sarmah_density --seeds 0-4                            # §6a-bis density sweep
 ```
+
+Every entrypoint mounts the local `data/` directory into the container (so nothing is committed or
+downloaded at run time), writes a metrics CSV to `results/`, and saves trained vector spaces to
+`results/vectors/`. See the **Modal entrypoints** table at the bottom for what each one does.
 
 > Node2Vec here is gensim Word2Vec — **CPU-bound** (`workers=1` for determinism). Modal's
 > win is many parallel CPU containers, not a GPU. A GPU Node2Vec (PyTorch-Geometric) is a
@@ -113,6 +206,7 @@ modal run modal_app.py --universe r3000 --period 2y --seeds 0-19 --methods all
 | **Co-movement removal (graph construction)** | `benchmark/lasso_experiment.py` — raw correlation vs partial-correlation (Graphical Lasso) vs market-neutral residual, at matched density. See "Graph construction" below. |
 | **Direct Dolphin et al. comparison** | `benchmark/dolphin_benchmark.py` (or `modal run modal_app.py::dolphin`) — our methods through their SVM-sector protocol on the reconstructed 611-stock benchmark. See "Direct comparison to Dolphin et al." below. |
 | **Speak the literature's metrics** | `benchmark/literature_comparison.py` — V-measure (Sarmah) + SVM-F1 (Dolphin) across all saved vectorspaces → `results/literature_metrics.csv`. |
+| **OOS hedging / risk reduction** | `python -m benchmark.hedging_experiment` (or `modal run modal_app.py::hedging`) — out-of-sample peer-hedge residual volatility. |
 
 ## Graph construction: removing co-movement
 
@@ -223,43 +317,122 @@ cross-family sweep: `python -m benchmark.embedding_families` / `modal run modal_
 
 ## Repository layout
 
+Annotated tree — every file, with the classes/functions worth opening (CLI = runnable with
+`python -m <module> --help`):
+
 ```
-train_vectors.py      Config + DataFetcher + GraphBuilder + EmbeddingTrainer (Node2Vec)
-tickers.py            Polygon universe list (used by jobs/fetch_prices)
-modal_app.py          cloud fan-out of the sweep
-benchmark/            # the paper's evaluation harness (no Pinecone, reproducible)
-  evaluation.py           per-stock match frames; hit-rate@k, success@k, MRR; raw-corr baseline
-  labels.py               GICS labels at all 4 granularities
-  run_benchmark.py        parameterized entrypoint + competitor registry  (CLI, train+score)
-  embedding_methods.py    embedder dispatcher: node2vec | spectral | netmf | contrastive | raw_*
-  contrastive_embedding.py  Dolphin's contrastive method, reimplemented (NumPy + Adam, no torch)
-  embedding_families.py   does any embedding family beat raw features? hit/SVM/V across families (CLI)
-  temporal_validation.py  out-of-sample: stability across disjoint windows + future-corr test (CLI)
-  build_vectors.py        step 1: train + save a vector space to JSON  (CLI)
-  stats_from_vectors.py   step 2: all metrics + paired significance from saved JSON  (CLI)
-  significance.py         Wilcoxon / McNemar / bootstrap / Holm / BH-FDR
-  clustering_metrics.py   V-measure / NMI / ARI
-  classification_metrics.py  SVM 5-fold sector classification (Dolphin et al. protocol)
-  matched_sampling.py     universe/covariance confound experiment
-  lasso_experiment.py     co-movement removal: correlation vs lasso vs market-neutral (CLI)
-  dolphin_benchmark.py    run our methods on Dolphin's benchmark, SVM-sector protocol (CLI)
-  reproduce_sarmah.py     controlled reproduction of Sarmah et al. (S&P 500 2021, V-measure) (CLI)
-  sarmah_improvements.py  apply all our techniques to Sarmah's network; which beat the MST baseline (CLI)
-  literature_comparison.py  V-measure (Sarmah) + SVM-F1 (Dolphin) over all saved vectorspaces (CLI)
-jobs/
-  build_gics_hierarchy.py   build data/gics_hierarchy.csv (with completeness check)
-  fetch_prices.py           regenerate price CSVs from Polygon
-  prep_kaggle_data.py       distill the Kaggle 1970-2018 dataset into project artifacts
-data/   results/      inputs and outputs (gitignored)
-trash/                # legacy / product code, not part of the paper (gitignored; see trash/README.md)
+train_vectors.py            THE ENGINE. One pass: returns → matrix → graph → Node2Vec embedding.
+  Config                      every knob (see "Config knobs" below); RunSpec.to_config() fills it
+  DataFetcher.fetch_returns   load data/<universe>_<period>.csv → cleaned daily returns
+  GraphBuilder.build          returns → graph (threshold | mst | knn, + forced-connectivity repair)
+    ._compute_matrix            correlation / Graphical-Lasso precision matrix
+    ._spectral_clean            PCA market-mode removal & RMT band (eigsh, O(n²k))
+    ._residualize_market        market-neutral (SPY/proxy) residuals
+    ._cross_sectional_demean    subtract each day's cross-sectional mean
+    ._rescue_islands            Forced Connectivity: repair under-degree nodes
+  EmbeddingTrainer.train      graph → {ticker: vector} via gensim Node2Vec (workers=1, seeded)
+  PineconeClient/Evaluator/Pipeline   LEGACY product path (not used by the benchmark)
+tickers.py                  Polygon universe ticker lists (used by jobs/fetch_prices)
+modal_app.py                CLOUD fan-out — one @app.local_entrypoint per experiment (see table)
+
+benchmark/                  THE EVALUATION HARNESS (no Pinecone, fully reproducible)
+  run_benchmark.py            RunSpec (a config minus the seed); train_embedding(); the method
+                              registries competitor_specs() / comovement_specs(); run_raw_correlation()
+                              baseline; aggregate_over_seeds()                                   (CLI)
+  embedding_methods.py        build_embeddings() dispatcher → node2vec | spectral (Laplacian
+                              eigenmaps) | netmf (DeepWalk-as-matrix-factorization) | contrastive |
+                              raw_corr | raw_returns; the leak-free raw-feature vectorizers
+  contrastive_embedding.py    Dolphin et al. (2407.18645) contrastive method, reimplemented in
+                              NumPy + hand-rolled Adam (no torch): build_cooccurrence(),
+                              hypothesis_sampling(), train_contrastive_embedding()
+  labels.py                   load_all_levels() — GICS sector/group/industry/sub-industry per ticker
+  evaluation.py               neighbor_match_frame() (per-stock substrate) → hit-rate@k, success@k,
+                              MRR (metric_bundle); raw_correlation_match_frame() baseline
+  clustering_metrics.py       clustering_metrics() — KMeans V-measure / NMI / ARI / homogeneity
+  classification_metrics.py   svm_classification() — SVM 5-fold weighted-F1 (Dolphin's protocol)
+  significance.py             compare_methods(), wilcoxon_compare(), mcnemar_compare(),
+                              bootstrap_ci(), Holm + BH-FDR, effect sizes
+  build_vectors.py            STEP 1 — train a method over seeds, save results/vectors/*.json   (CLI)
+  stats_from_vectors.py       STEP 2 — all metrics (+ --compare significance) from a saved json (CLI)
+  embedding_families.py       §6d — node2vec/spectral/netmf/contrastive vs raw, hit/SVM/V          (CLI)
+  temporal_validation.py      §6e — disjoint-window stability + future-correlation OOS test        (CLI)
+  hedging_experiment.py       §6g — out-of-sample peer-hedge residual volatility (economic test)      (CLI)
+  dolphin_benchmark.py        §6b — our methods through Dolphin's SVM-sector protocol; METHOD_FLAGS (CLI)
+  reproduce_sarmah.py         §6a — faithful Sarmah reproduction (MST + their Node2Vec, V-measure)  (CLI)
+  sarmah_improvements.py      §6a-bis — every technique on Sarmah's exact network; METHODS          (CLI)
+  literature_comparison.py    V-measure (Sarmah) + SVM-F1 (Dolphin) over all saved vectorspaces     (CLI)
+  matched_sampling.py         universe size-vs-composition confound: run_matched_node_count()       (CLI)
+  lasso_experiment.py         §4a — Graphical Lasso vs correlation at matched density (small n)      (CLI)
+
+jobs/                       DATA PREP (not needed to read results; only to rebuild data/)
+  fetch_prices.py             Polygon → data/<universe>_<period>.csv                                (CLI)
+  prep_kaggle_data.py         Kaggle 1970-2018 dump → data/dolphin/ + sarmah_2017_returns.csv       (CLI)
+  build_gics_hierarchy.py     build/validate data/gics_hierarchy.csv                                (CLI)
+
+data/      price panels + the 2 committed label files (rest gitignored; see "Data")
+results/   outputs (gitignored): *.csv metrics tables + vectors/*.json saved vector spaces
+trash/     legacy product code (Pinecone/FastAPI/old grid search), NOT part of the paper (gitignored)
 ```
 
-The benchmark depends only on `train_vectors.py` + `benchmark/`; data prep lives in `jobs/`.
-Superseded grid-search/Pinecone scripts and the old FastAPI product have been moved to
-`trash/` and are excluded from the published repo.
+The benchmark depends only on `train_vectors.py` + `benchmark/`; `jobs/` is just data prep and
+`modal_app.py` is just cloud orchestration of the same code.
+
+### Config knobs (`train_vectors.py::Config`, set per-run via `RunSpec`)
+
+| Knob | Values | Controls |
+|---|---|---|
+| `embedder` | `node2vec`·`spectral`·`netmf`·`contrastive`·`raw_corr`·`raw_returns` | which representation (default node2vec) |
+| `graph_filtering` | `threshold`·`mst`·`knn` | how the matrix becomes a graph |
+| `repair_islands` / `min_degree` | bool / int | Forced Connectivity (threshold + degree repair) |
+| `knn_k` | int | edges per node in the kNN graph |
+| `mst_distance_transform` / `mst_extra_edges_pct` | bool / float | Mantegna-distance MST; PMFG-style extra edges |
+| `use_precision_matrix` / `lasso_alpha` | bool / float | Graphical Lasso (partial correlation); α=0 ⇒ CV |
+| `cross_sectional_demean` | bool | subtract each day's cross-sectional mean |
+| `market_neutral` | bool | regress out a market factor (SPY/proxy) |
+| `spectral_clean` / `spectral_k` | `none`·`market`·`topk`·`rmt` / int | PCA market-mode removal / RMT band cleaning |
+| `walk_p` · `walk_q` · `walk_length` · `num_walks` · `window` | floats/ints | Node2Vec random-walk + skip-gram params |
+| `dimensions` · `seed` | ints | embedding size · RNG seed (sweep many, report mean±std) |
+| `training_period` · `cache_file` · `cutoff_date` | str | which price panel and trailing window |
+
+### Method & embedder vocabulary (names used throughout RESULTS.md)
+
+- **Graph construction** (`competitor_specs`): `mst` (Sarmah-style tree) · `pmfg_approx` (MST + 5% extra
+  edges) · `knn` · `threshold_norepair` · `forced_connectivity` (FC = threshold + degree repair).
+- **Co-movement removal** (`comovement_specs`, all on a kNN graph, only the *matrix* differs):
+  `corr` (raw) · `demean` · `market_neutral` · `pca_market` · `rmt` · `lasso`.
+- **Embedding families** (`embedding_methods.build_embeddings`): `node2vec` (random walk + skip-gram) ·
+  `spectral` (Laplacian eigenmaps) · `netmf` (skip-gram as matrix factorization) · `contrastive`
+  (Dolphin's method) · `raw_corr` / `raw_returns` (no-embedding baselines).
+
+### Metrics at a glance
+
+| Metric | What | File |
+|---|---|---|
+| hit-rate@k · success@k · MRR | do the k nearest neighbours share the GICS label? (**headline**) | `evaluation.py` |
+| V-measure · NMI · ARI | KMeans-partition agreement with labels (Sarmah's language) | `clustering_metrics.py` |
+| SVM-F1 (5-fold) | can an SVM read the sector off the vectors? (Dolphin's protocol) | `classification_metrics.py` |
+| Wilcoxon · McNemar · bootstrap CI · BH-FDR | paired significance with effect sizes | `significance.py` |
+
+### Modal entrypoints (`modal run modal_app.py::<name>`)
+
+| Entrypoint | Experiment | RESULTS.md |
+|---|---|---|
+| `main --suite competitor\|comovement` | graph-construction / co-movement sweep, saves vectorspaces | §3, §4 |
+| `families` | embedding-family comparison (node2vec/spectral/netmf/contrastive vs raw) | §6d |
+| `dolphin` | our methods through Dolphin's SVM-sector protocol | §6b |
+| `dim_sweep` | embedding-dimension robustness | §6f |
+| `pq_sweep` | Node2Vec p/q sensitivity (provenance check) | §6f |
+| `sarmah_density` | denser kNN/FC graphs on Sarmah's network | §6a-bis |
+| `hedging` | out-of-sample peer-hedge risk experiment | §6g |
 
 ## Reproducibility notes
 
 - All randomness is seeded (`Config.seed` → Node2Vec walks + Word2Vec init; `workers=1`).
 - A harmless `Exception ignored in: 'gensim.models.word2vec_inner.our_dot_float'` line may
   print on some BLAS builds during interpreter shutdown; it does not affect results.
+
+## Scope and limitations
+
+- **Survivorship bias.** All universes are survivor panels: stocks with missing history or delistings are dropped before analysis. The results compare methods under clean, idealised conditions and are not a recommendation for live trading.
+- **GICS is not ground truth.** We use GICS as a convenient reference taxonomy, but a company's economic identity can change while its GICS label stays fixed. A different reference dictionary would yield different "correct" neighbours.
+- **Method comparison, not suitability.** The paper asks "which embedding representation recovers GICS structure best?" and "do embeddings beat raw-feature baselines?", not "should these embeddings be used in a trading strategy?". The out-of-sample hedging test is included precisely to show that representation quality does not automatically translate to portfolio improvement.
