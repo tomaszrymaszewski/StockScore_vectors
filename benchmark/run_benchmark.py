@@ -61,7 +61,7 @@ class RunSpec:
     walk_q: float = 7.2
     dimensions: int = 64
     threshold: float = 0.65
-    graph_mode: str = "threshold"        # threshold | knn | mst
+    graph_mode: str = "threshold"        # threshold | knn | signed_knn | mst
     repair_islands: bool = True
     min_degree: int = 3                   # Forced-Connectivity target min degree (sweepable)
     use_lasso: bool = False

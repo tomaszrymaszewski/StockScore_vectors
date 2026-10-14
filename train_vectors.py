@@ -497,26 +497,40 @@ class GraphBuilder:
             repaired = " + repair" if self.config.repair_islands else " (no repair)"
             print(f"🕸️  Graph (Threshold > {thresh}{repaired}): {G.number_of_nodes()} nodes, {edge_count} edges")
 
-        elif self.config.graph_filtering == "knn":
+        elif self.config.graph_filtering in ("knn", "signed_knn"):
             # kNN graph: connect each node to its K strongest-correlated peers (undirected
             # union). The closest structural cousin to Forced Connectivity, and a standard
             # competitor baseline.
+            signed = self.config.graph_filtering == "signed_knn"
             k = self.config.knn_k
             n = len(col_names)
             k = min(k, n - 1)
-            abs_matrix = np.abs(np.nan_to_num(matrix))
-            np.fill_diagonal(abs_matrix, -np.inf)
+            if signed:
+                # SIGNED kNN: rank peers by SIGNED correlation (most positive first), so a
+                # strongly anti-correlated stock is never selected as a peer. Edge weight is
+                # rho floored at a tiny positive value -- anti-correlated edges (rho < 0,
+                # admitted only via another endpoint's top-k) keep the geometrically correct
+                # NEAR-ZERO weight, i.e. random-walk walks rarely traverse them, without
+                # breaking samplers that require positive weights.
+                sim_matrix = np.nan_to_num(matrix)
+            else:
+                sim_matrix = np.abs(np.nan_to_num(matrix))
+            np.fill_diagonal(sim_matrix, -np.inf)
             for i in range(n):
-                # Top-k peers by |correlation| for node i
-                nbrs = np.argpartition(-abs_matrix[i], kth=k - 1)[:k]
+                # Top-k peers for node i (by |corr| for knn, by signed corr for signed_knn)
+                nbrs = np.argpartition(-sim_matrix[i], kth=k - 1)[:k]
                 for j in nbrs:
-                    w = float(abs_matrix[i, j])
+                    w_raw = float(matrix[i, j]) if signed else float(sim_matrix[i, j])
+                    w = abs(w_raw) if signed else w_raw
                     # Floor to a tiny positive weight: with a sparse matrix (e.g. Graphical
                     # Lasso) a node can have fewer than k nonzero peers, leaving zero-weight
-                    # edges that make the Node2Vec walk sampler's weights sum to zero.
+                    # edges that make the Node2Vec walk sampler's weights sum to zero. For
+                    # signed_knn this floor is applied to |rho|, preserving the sign of the
+                    # relationship in the magnitude (negative rho -> near-zero weight).
                     w = max(w, 1e-8) if np.isfinite(w) else 1e-8
                     G.add_edge(col_names[i], col_names[j], weight=w)
-            print(f"🕸️  Graph (kNN k={k}): {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+            label = "signed kNN" if signed else "kNN"
+            print(f"🕸️  Graph ({label} k={k}): {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
         else:
             raise ValueError(f"Unknown graph filtering method: {self.config.graph_filtering}")
