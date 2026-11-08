@@ -1,0 +1,26 @@
+site_name: stock-embeddings
+site_url: https://docs.stockscore.live/
+site_description: Train stock embeddings from price data
+repo_url: https://github.com/tomaszrymaszewski/StockScore_vectors
+
+theme:
+  name: material
+  palette:
+    scheme: default
+    primary: indigo
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Usage: usage.md
+  - Configuration: configuration.md
+  - Embedding families: embedders.md
+  - API reference: api.md
+  - Research paper: research.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - toc:
+      permalink: true

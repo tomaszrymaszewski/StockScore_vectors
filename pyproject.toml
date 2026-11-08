@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-embeddings"
+version = "0.1.0"
+description = "Train stock embeddings (Node2Vec, spectral, NetMF, raw baselines) from price data"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Tomasz Rymaszeski" }]
+keywords = [
+    "stocks", "embeddings", "node2vec", "graph", "finance",
+    "correlation", "quantitative-finance", "representation-learning",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "networkx>=3.1",
+    "scikit-learn>=1.3",
+    "scipy>=1.11",
+    "gensim>=4.3",
+    "node2vec>=0.5.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "build", "twine"]
+docs = ["mkdocs-material>=9"]
+
+[project.urls]
+Homepage = "https://github.com/tomaszrymaszewski/StockScore_vectors"
+Documentation = "https://docs.stockscore.live/"
+Repository = "https://github.com/tomaszrymaszewski/StockScore_vectors"
+Changelog = "https://github.com/tomaszrymaszewski/StockScore_vectors/blob/main/CHANGELOG.md"
+Paper = "https://dx.doi.org/10.2139/ssrn.7591058"
+
+[tool.setuptools.packages.find]
+include = ["stock_embeddings*"]

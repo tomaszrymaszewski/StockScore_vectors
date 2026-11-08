@@ -1,7 +1,9 @@
+# ---- Research code & data (kept locally, not published) ----
+research/
+
 # ---- Secrets ----
 .env
 .env.*
-!.env.example
 
 # ---- Python ----
 __pycache__/
@@ -9,45 +11,17 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ipynb_checkpoints/
+build/
+dist/
 
 # ---- Virtual environments ----
 venv/
 .venv/
+.venv*/
 env/
 
-# ---- Data (large / regenerable; see jobs/ and README) ----
-data/*.csv
-data/outputs/
-data/sector_composite_vectors.csv
-# raw Kaggle download (huge prices CSV); distilled via jobs/prep_kaggle_data.py
-data/kaggle_raw/
-# reconstructed Dolphin 611-stock benchmark files
-data/dolphin/
-*.npy
-# Keep the small reference files needed to build GICS labels out-of-the-box:
-#   - gics_hierarchy.csv: hand-built sub-industry -> sector rollup (jobs/build_gics_hierarchy.py)
-#   - Holdings_details_Russell_3000_ETF.csv: iShares IWV holdings (ticker -> sub-industry), ~278KB
-# The large *price* CSVs stay ignored and are regenerated via jobs/fetch_prices.py.
-!data/gics_hierarchy.csv
-!data/Holdings_details_Russell_3000_ETF.csv
-
-# ---- Generated outputs ----
-reports/
-results/vectors/
-
-# ---- Retired legacy/product code (kept locally, not published) ----
-trash/
-
-# ---- Editors / OS ----
+# ---- Editors / OS / tool caches ----
 .idea/
 .vscode/
 .DS_Store
-/README.pdf
-/RESULTS.pdf
-/Paper.md
-/results/temporal_sweep.log
-/results/csv files/hedging_r3000_modal_per_stock.csv
-
-# ---- Local environments / tool caches ----
-.venv311/
-graphify-out/
+.serena/
